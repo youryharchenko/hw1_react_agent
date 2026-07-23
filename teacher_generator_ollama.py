@@ -1,7 +1,5 @@
-import json
 from typing import Annotated, Optional, Sequence, TypedDict, cast
 
-import sympy as sp
 from langchain_core.messages import (
     AIMessage,
     BaseMessage,
@@ -9,82 +7,13 @@ from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
 )
-from langchain_core.tools import tool
 from langchain_ollama import ChatOllama
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
-from pydantic import BaseModel, Field
 
-# =====================================================================
-# КРОК 1: Pydantic-схеми
-# =====================================================================
+from tools import GeneratedMathProblem, fraction_calculator_tool, sympy_solver_tool
 
-
-class SolveAlgebraicInput(BaseModel):
-    """Схема валідації вхідних даних для розв'язання алгебраїчних виразів."""
-
-    expression_str: str = Field(
-        ...,
-        description="Алгебраїчне рівняння або вираз у форматі Python/SymPy, наприклад 'x**2 - 5*x + 6'. ПІДНЕСЕННЯ ДО СТЕПЕНЯ ТІЛЬКИ ЧЕРЕЗ '**'!",
-    )
-    variable: str = Field(default="x", description="Змінна для розв'язання")
-
-
-class GeneratedMathProblem(BaseModel):
-    """Фінальна структура математичної задачі."""
-
-    topic: str = Field(..., description="Тема з шкільної математики")
-    grade: int = Field(..., description="Клас")
-    title: str = Field(..., description="Коротка назва задачі")
-    problem_statement: str = Field(..., description="Текст умови задачі")
-    canonical_equation: str = Field(..., description="Математична модель/рівняння")
-    step_by_step_solution: str = Field(
-        ..., description="Покроковий еталонний розв'язок"
-    )
-    canonical_answer: str = Field(..., description="Фінальна коротка відповідь")
-
-
-# =====================================================================
-# КРОК 2: Інструмент точної математики (SymPy Tool)
-# =====================================================================
-
-
-@tool(args_schema=SolveAlgebraicInput)
-def sympy_solver_tool(expression_str: str, variable: str = "x") -> str:
-    """
-    Точно розв'язує рівняння expression_str = 0 відносно змінної variable за допомогою SymPy.
-    """
-    try:
-        # Автоматична заміна популярної помилки локальних моделей '^' на '**'
-        cleaned_expr = expression_str.replace("^", "**")
-
-        var = sp.Symbol(variable)
-        expr = sp.sympify(cleaned_expr)
-        solutions = sp.solve(expr, var)
-
-        # Фільтруємо дійсні розв'язки для шкільної програми
-        real_solutions = [sol for sol in solutions if sol.is_real]
-
-        return json.dumps(
-            {
-                "status": "success",
-                "expression": str(expr),
-                "solutions": [str(sol) for sol in real_solutions],
-                "raw_solutions": [str(sol) for sol in solutions],
-            },
-            ensure_ascii=False,
-        )
-    except Exception as e:
-        return json.dumps(
-            {
-                "status": "error",
-                "message": f"Не вдалося обчислити вираз '{expression_str}': {str(e)}",
-            },
-            ensure_ascii=False,
-        )
-
-
-tools = [sympy_solver_tool]
+tools = [sympy_solver_tool, fraction_calculator_tool]
 tools_by_name = {t.name: t for t in tools}
 
 
@@ -105,11 +34,14 @@ class TeacherState(TypedDict):
 # =====================================================================
 
 # Вказуємо модель, завантажену в Ollama (наприклад, qwen2.5:14b або qwen2.5:7b)
-MODEL_NAME = "qwen2.5:7b"
+MODEL_NAME = "qwen2.5-coder:7b"
+OLLAMA_SERVER_IP = "192.168.2.102"
 
 llm = ChatOllama(
     model=MODEL_NAME,
-    temperature=0.6,
+    temperature=0.1,
+    num_predict=1024,
+    base_url=f"http://{OLLAMA_SERVER_IP}:11434",
 )
 
 llm_with_tools = llm.bind_tools(tools)
@@ -126,12 +58,21 @@ def generate_raw_problem_node(state: TeacherState) -> dict:
         content=(
             f"Ти досвідчений вчитель математики української школи. Створи цікаву сюжетну текстову задачу "
             f"для {state['grade']} класу на тему '{state['topic']}'.\n\n"
+            f"ВІДПОВІДНІСТЬ КЛАСУ:\n"
+            f"   - Для 1-4 класів: використовуй прості арифметичні дії (+, -, *, /). У 'canonical_equation' пиши просто вираз, наприклад '9 * 16 = 144'.\n"
+            f"   - Для 5-6 класів: використовуй звичайні/десяткові дроби та tool `fraction_calculator_tool` або `geometry_2d_tool`.\n"
+            f"   - Для 7-9 класів: використовуй алгебраїчні рівняння та tool `sympy_solver_tool`.\n\n"
+            f"КОНТЕКСТ СЮЖЕТУ:\n"
+            f"1. Використовуй тільки реальні життєві ситуації (наприклад: ділянка землі, фотокартка, "
+            f"   cпортивний майданчик, кімната, басейн, майстерня).\n"
+            f"2. Числа у задачі мають бути логічно пов'язані з рівнянням.\n\n"
             f"ВАЖЛИВО:\n"
             f"1. Сформулюй математичне рівняння, яке описує задачу.\n"
-            f"2. Використай інструмент `sympy_solver_tool`, щоб розв'язати його.\n"
-            f"3. Для виразу у `sympy_solver_tool` використовуй синтаксис Python: степені через '**' (наприклад 'x**2 + 3*x - 10').\n"
-            f"4. Пиши ВИКЛЮЧНО літературною українською мовою.\n"
-            f"5. Ретельно перевір весь текст на наявність русизмів перед формуванням JSON.\n"
+            f"2. Використовувати рівняння з однією змінною (x).\n"
+            f"3. НЕ вигадуй розв'язок сам! ОБОВ'ЯЗКОВО зроби виклик інструменту `sympy_solver_tool`\n"
+            f"4. Для виразу у `sympy_solver_tool` використовуй синтаксис Python: степені через '**' (наприклад 'x**2 + 3*x - 10').\n"
+            f"5. Пиши ВИКЛЮЧНО літературною українською мовою.\n"
+            f"6. Ретельно перевір весь текст на наявність русизмів перед формуванням JSON.\n"
         )
     )
 
@@ -206,9 +147,16 @@ teacher_app = workflow.compile()
 
 
 if __name__ == "__main__":
+    # test_input: TeacherState = {
+    #     "topic": "Площа прямокутника (задача має зводитися до квадратного рівняння)",
+    #     "grade": 8,
+    #     "messages": [],
+    #     "generated_problem": None,
+    # }
+
     test_input: TeacherState = {
-        "topic": "Площа прямокутника (задача має зводитися до квадратного рівняння)",
-        "grade": 8,
+        "topic": "Задача на дроби",
+        "grade": 5,
         "messages": [],
         "generated_problem": None,
     }
