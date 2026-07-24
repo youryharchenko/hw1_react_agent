@@ -154,8 +154,15 @@ if __name__ == "__main__":
     #     "generated_problem": None,
     # }
 
+    # test_input: TeacherState = {
+    #     "topic": "Задача на дроби",
+    #     "grade": 5,
+    #     "messages": [],
+    #     "generated_problem": None,
+    # }
+
     test_input: TeacherState = {
-        "topic": "Задача на дроби",
+        "topic": "Задача на площу трикутника",
         "grade": 5,
         "messages": [],
         "generated_problem": None,

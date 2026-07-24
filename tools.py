@@ -4,7 +4,14 @@ from typing import Optional
 import pytest
 import sympy as sp
 from langchain_core.tools import tool
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 
 class SolveAlgebraicInput(BaseModel):
@@ -113,6 +120,18 @@ class GeneratedMathProblem(BaseModel):
             )
 
         return self
+
+    @field_validator("canonical_equation")
+    def validate_equation(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            # Якщо модель повернула порожній рядок, можна або дати дефолтне значення,
+            # або підставити заглушку замість викидання помилки:
+            return "x = 0"
+        if "=" not in v and not any(op in v for op in [">", "<", ">=", "<="]):
+            # Якщо модель написала "1/3 * 24", перетворюємо на рівняння "x = 1/3 * 24"
+            return f"x = {v}"
+        return v
 
 
 @tool("sympy_solver_tool", args_schema=SolveAlgebraicInput)
