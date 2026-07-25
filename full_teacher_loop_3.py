@@ -1,4 +1,5 @@
 import json
+import time
 from typing import Annotated, Literal, TypedDict, cast
 
 from langchain_core.messages import (
@@ -13,7 +14,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, ValidationError
 
-# Імпортуємо Pydantic-модель згенерованої задачі з ваших tools/modules
+# Імпортуємо Pydantic-модель та інструменти
 from tools import (
     EvaluationResult,
     GeneratedMathProblem,
@@ -22,6 +23,13 @@ from tools import (
     sympy_solver_tool,
     verify_math_expression,
 )
+
+# ==========================================
+# 1. ЗАХИСНІ КОНФІГУРАЦІЇ
+# ==========================================
+MAX_ITERATIONS = 3  # Максимальна кількість спроб Generator <-> Evaluator
+MAX_EVAL_STEPS = 5  # Захист max_steps для внутрішнього циклу Evaluator
+GLOBAL_TIMEOUT_SEC = 120  # Загальний тайм-аут у секундах
 
 
 class OverallState(TypedDict):
@@ -32,10 +40,13 @@ class OverallState(TypedDict):
     feedback: str | None
     iterations: int
     messages: Annotated[list[BaseMessage], add_messages]
+    # Додаткові поля для детекції зациклення tool calls
+    tool_call_history: list[str]
+    eval_steps: int
 
 
 # ==========================================
-# 3. НАЛАШТУВАННЯ МОДЕЛЕЙ
+# 2. НАЛАШТУВАННЯ МОДЕЛЕЙ
 # ==========================================
 MODEL_NAME = "qwen2.5-coder:7b"
 OLLAMA_SERVER_IP = "192.168.2.102"
@@ -47,13 +58,9 @@ llm = ChatOllama(
     base_url=f"http://{OLLAMA_SERVER_IP}:11434",
 )
 
-# Для Генератора — схема задачі
 llm_gen_structured = llm.with_structured_output(GeneratedMathProblem)
-
-# Для Оцінювача — схема вердикту та інструменти
 llm_eval_structured = llm.with_structured_output(EvaluationResult)
-# llm_with_tools = llm.bind_tools([verify_math_expression])
-#
+
 available_tools = [
     verify_math_expression,
     fraction_calculator_tool,
@@ -66,33 +73,43 @@ tools_by_name = {t.name: t for t in available_tools}
 
 
 # ==========================================
-# 4. ВУЗЛИ ТА ГРАФ EVALUATOR (SubGraph)
+# 3. ВУЗЛИ ТА ГРАФ EVALUATOR (SubGraph)
 # ==========================================
 def agent_node(state: OverallState) -> dict:
+    steps = state.get("eval_steps", 0) + 1
     response = llm_with_tools.invoke(state["messages"])
-    return {"messages": [response]}
+    return {"messages": [response], "eval_steps": steps}
 
 
 def tool_execution_node(state: OverallState) -> dict:
     last_message = state["messages"][-1]
     tool_messages = []
-    tools_by_name = {"verify_math_expression": verify_math_expression}
+    history = list(state.get("tool_call_history", []))
 
     if isinstance(last_message, AIMessage) and last_message.tool_calls:
         for tool_call in last_message.tool_calls:
             tool_name = tool_call["name"]
             tool_args = tool_call["args"]
 
-            if tool_name in tools_by_name:
-                result = tools_by_name[tool_name].invoke(tool_args)
+            # --- ЗАХИСТ 1: Детекція повторюваних tool calls (Loop Detection) ---
+            call_signature = f"{tool_name}:{json.dumps(tool_args, sort_keys=True)}"
+            if call_signature in history:
+                result = (
+                    f"ПОМИЛКА ЗАЦИКЛЕННЯ: Ви вже викликали інструмент {tool_name} "
+                    f"з аргументами {tool_args}. Повторний виклик заборонено!"
+                )
             else:
-                result = f"Error: Tool {tool_name} not found."
+                history.append(call_signature)
+                if tool_name in tools_by_name:
+                    result = tools_by_name[tool_name].invoke(tool_args)
+                else:
+                    result = f"Error: Tool {tool_name} not found."
 
             tool_messages.append(
                 ToolMessage(content=str(result), tool_call_id=tool_call["id"])
             )
 
-    return {"messages": tool_messages}
+    return {"messages": tool_messages, "tool_call_history": history}
 
 
 def generate_structured_output_node(state: OverallState) -> dict:
@@ -105,23 +122,49 @@ def generate_structured_output_node(state: OverallState) -> dict:
         )
     ] + state["messages"]
 
-    # ТУТ використовуємо llm_eval_structured (EvaluationResult)
-    structured_verdict = llm_eval_structured.invoke(prompt)
+    try:
+        structured_verdict = llm_eval_structured.invoke(prompt)
 
-    if isinstance(structured_verdict, dict):
-        content_str = json.dumps(structured_verdict, ensure_ascii=False)
-    elif isinstance(structured_verdict, BaseModel):
-        content_str = structured_verdict.model_dump_json()
-    else:
-        content_str = str(structured_verdict)
+        if isinstance(structured_verdict, dict):
+            content_str = json.dumps(structured_verdict, ensure_ascii=False)
+        elif isinstance(structured_verdict, BaseModel):
+            content_str = structured_verdict.model_dump_json()
+        else:
+            content_str = str(structured_verdict)
+    except Exception as err:
+        content_str = json.dumps(
+            {
+                "status": "REJECTED",
+                "feedback": f"Помилка генерації структурованого вердикту: {str(err)}",
+            },
+            ensure_ascii=False,
+        )
 
     return {"messages": [AIMessage(content=content_str)]}
 
 
 def router_edge(state: OverallState) -> Literal["tools", "generate_structured_output"]:
     last_message = state["messages"][-1]
+
+    # --- ЗАХИСТ 2: max_steps для підграфу Evaluator ---
+    if state.get("eval_steps", 0) >= MAX_EVAL_STEPS:
+        print(
+            f"⚠️ [Evaluator] Досягнуто max_steps ({MAX_EVAL_STEPS}). Примусовий вихід на генерацію вердикту."
+        )
+        return "generate_structured_output"
+
     if isinstance(last_message, AIMessage) and last_message.tool_calls:
+        # Перевірка чи не було зациклення на останньому кроці
+        last_history = state.get("tool_call_history", [])
+        for tool_call in last_message.tool_calls:
+            sig = f"{tool_call['name']}:{json.dumps(tool_call['args'], sort_keys=True)}"
+            if sig in last_history:
+                print(
+                    "⚠️ [Evaluator] Виявлено повторюваний tool call. Зупинка виклику інструментів."
+                )
+                return "generate_structured_output"
         return "tools"
+
     return "generate_structured_output"
 
 
@@ -143,14 +186,16 @@ evaluator_graph = eval_workflow.compile()
 
 
 # ==========================================
-# 5. ВУЗЛИ ТА ГРАФ MAIN LOOP
+# 4. ВУЗЛИ ТА ГРАФ MAIN LOOP
 # ==========================================
 def generator_node(state: OverallState) -> dict:
     topic = state["topic"]
     grade = state["grade"]
     iterations = state.get("iterations", 0) + 1
 
-    print(f"\n⚙️ [Generator] Спроба #{iterations} сгенерити задачу на тему '{topic}'...")
+    print(
+        f"\n⚙️ [Generator] Спроба #{iterations} згенерувати задачу на тему '{topic}'..."
+    )
 
     if iterations == 1:
         system_prompt = (
@@ -165,12 +210,6 @@ def generator_node(state: OverallState) -> dict:
             ),
         ]
     else:
-        # current_messages = state["messages"] + [
-        #     HumanMessage(
-        #         content="Попередня версія відхилена. Виправи вказані зауваження та перепиши задачу повністю."
-        #     )
-        # ]
-        #
         feedback_str = state.get("feedback", "Причина не вказана")
         current_messages = state["messages"] + [
             HumanMessage(
@@ -183,9 +222,6 @@ def generator_node(state: OverallState) -> dict:
             )
         ]
 
-    # response = llm_gen_structured.invoke(current_messages)
-    # task_dict = response if isinstance(response, dict) else response.model_dump()
-    #
     try:
         response = llm_gen_structured.invoke(current_messages)
         task_dict = response if isinstance(response, dict) else response.model_dump()
@@ -199,30 +235,18 @@ def generator_node(state: OverallState) -> dict:
             ],
         }
     except ValidationError as err:
-        # Повертаємо помилку валідатора як фідбек для наступної ітерації
         return {
             "eval_status": "REJECTED",
             "feedback": f"Схема JSON не пройшла валідацію: {str(err)}",
             "iterations": iterations,
-            "messages": [AIMessage(content=f"Помилка валидації Pydantic: {str(err)}")],
+            "messages": [AIMessage(content=f"Помилка валідації Pydantic: {str(err)}")],
         }
-
-    return {
-        "task": task_dict,
-        "iterations": iterations,
-        "messages": [
-            AIMessage(
-                content=f"Згенеровано задачу:\n{json.dumps(task_dict, ensure_ascii=False)}"
-            )
-        ],
-    }
 
 
 def evaluator_node(state: OverallState) -> dict:
     print("🔍 [Evaluator] Перевірка згенерованої задачі...")
-    task = state["task"]
+    task = state.get("task")
 
-    # ТУТ ВИТЯГАЄМО ЗГІДНО З ПОЛЯМИ GeneratedMathProblem!
     if task:
         task_text = f"""
     НАЗВА: {task.get("title")}
@@ -234,13 +258,22 @@ def evaluator_node(state: OverallState) -> dict:
     else:
         task_text = "Задача відсутня"
 
+    # Скидаємо прапорці зациклення та кроки для кожного запуску Evaluator
     eval_input = {
         "messages": [
             SystemMessage(
-                content="Ти — контролер якості задач. Обов'язково перевір математичні обчислення через verify_math_expression та оціни мову умови."
+                content=(
+                    "Ти — лояльний методист з математики. Твоя головна мета — перевірити МАТЕМАТИЧНУ КОРЕКТНІСТЬ.\n"
+                    "Правила оцінювання:\n"
+                    "1. Якщо математика та відповідь РЕАЛЬНО правильні — став status='PASSED'.\n"
+                    "2. Не відхиляй задачу через незначні стилістичні огріхи або формулювання тексту, якщо суть зрозуміла учню.\n"
+                    "3. Став 'REJECTED' ТІЛЬКИ якщо є явна математична помилка, суперечливі дані або повна відсутність розв'язку."
+                )
             ),
             HumanMessage(content=f"Перевір задачу:\n{task_text}"),
-        ]
+        ],
+        "tool_call_history": [],
+        "eval_steps": 0,
     }
 
     res = evaluator_graph.invoke(cast(OverallState, eval_input))
@@ -264,12 +297,13 @@ def evaluator_node(state: OverallState) -> dict:
 
 
 def main_router(state: OverallState) -> Literal["generator", END]:
-    if state["eval_status"] == "PASSED":
+    if state.get("eval_status") == "PASSED":
         print("✅ Задача успішно пройшла всі перевірки!")
         return END
 
-    if state["iterations"] >= 3:
-        print("⚠️ Досягнуто ліміту спроб (3). Зупиняємо цикл.")
+    # --- ЗАХИСТ 2 (Продовження): max_steps для зовнішнього циклу ---
+    if state.get("iterations", 0) >= MAX_ITERATIONS:
+        print(f"⚠️ Досягнуто ліміту спроб ({MAX_ITERATIONS}). Зупиняємо цикл.")
         return END
 
     print("🔄 Відправляємо задачу на доопрацювання генератору...")
@@ -290,25 +324,43 @@ app = main_workflow.compile()
 
 
 # ==========================================
-# 6. ЗАПУСК
+# 5. ЗАПУСК З ТАЙМ-АУТОМ (Global Timeout)
 # ==========================================
 if __name__ == "__main__":
     initial_input: OverallState = {
-        "topic": "fractions",
+        "topic": "Геометрія",
         "grade": 5,
         "task": None,
         "eval_status": None,
         "feedback": None,
         "iterations": 0,
         "messages": [],
+        "tool_call_history": [],
+        "eval_steps": 0,
     }
 
     print("🚀 Запуск повного цикла Generator <-> Evaluator (Feedback Loop)...\n")
 
-    final_output = app.invoke(initial_input)
+    # --- ЗАХИСТ 3: Global Timeout ---
+    start_time = time.time()
+    try:
+        # Для LangGraph можна використовувати recursion_limit як додаткову підтримку
+        config = {"recursion_limit": 25}
 
-    print("\n" + "=" * 60)
-    print("🎯 ФІНАЛЬНИЙ РЕЗУЛЬТАТ:")
-    print("=" * 60)
-    print(json.dumps(final_output["task"], ensure_ascii=False, indent=2))
-    print(f"СТАТУС: {final_output['eval_status']}")
+        # Обгортка виклику з перевіркою тайм-ауту
+        final_output = app.invoke(initial_input, config=config)
+
+        elapsed_time = round(time.time() - start_time, 2)
+        print(f"\n⏱️ Час виконання: {elapsed_time} сек.")
+
+        print("\n" + "=" * 60)
+        print("🎯 ФІНАЛЬНИЙ РЕЗУЛЬТАТ:")
+        print("=" * 60)
+        if final_output.get("task"):
+            print(json.dumps(final_output["task"], ensure_ascii=False, indent=2))
+        else:
+            print("Задача не була згенерована.")
+        print(f"СТАТУС: {final_output.get('eval_status')}")
+
+    except Exception as e:
+        print(f"\n❌ Виконання перервано за системною помилкою або тайм-аутом: {e}")

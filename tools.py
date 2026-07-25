@@ -1,5 +1,5 @@
 import json
-from typing import Optional
+from typing import Literal, Optional, cast
 
 import pytest
 import sympy as sp
@@ -134,6 +134,64 @@ class GeneratedMathProblem(BaseModel):
         return v
 
 
+class EvaluationResult(BaseModel):
+    """Результат перевірки та оцінки математичної задачі."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    is_correct_math: bool = Field(
+        description="Чи є математичні обчислення в умовах та розв'язку правильними?"
+    )
+    is_clear_text: bool = Field(
+        description="Чи написана умова зрозумілою мовою без росіянізмів та дивних формулювань?"
+    )
+    status: Literal["PASSED", "REJECTED"] = Field(
+        description="Загальний вердикт: PASSED якщо математика і текст OK, інакше REJECTED"
+    )
+    feedback: str = Field(
+        description="Детальний коментар або описи знайдених помилок (якщо є)"
+    )
+
+    @model_validator(mode="after")
+    def validate_evaluation_consistency(self) -> "EvaluationResult":
+        # 1. Очищення фідбеку від крайових пробілів
+        self.feedback = self.feedback.strip()
+
+        # 2. Логічне узгодження: PASSED можливий ТІЛЬКИ якщо і математика, і текст правильні
+        if self.is_correct_math and self.is_clear_text:
+            if self.status != "PASSED":
+                raise ValueError(
+                    "Якщо математика та текст правильні (is_correct_math=True, is_clear_text=True), "
+                    "статус 'status' має бути обов'язково 'PASSED'."
+                )
+        else:
+            if self.status != "REJECTED":
+                raise ValueError(
+                    f"Якщо є помилки у математиці або тексті (is_correct_math={self.is_correct_math}, "
+                    f"is_clear_text={self.is_clear_text}), статус 'status' має бути обов'язково 'REJECTED'."
+                )
+
+        # 3. Перевірка мінімальної довжини фідбеку
+        if len(self.feedback) < 5:
+            raise ValueError(
+                "Коментар/фідбек ('feedback') занадто короткий (має бути не менше 5 символів)."
+            )
+
+        # 4. Якщо вердикт REJECTED, фідбек має містити розяснення (не бути банальною заглушкою)
+        if self.status == "REJECTED" and self.feedback.lower() in [
+            "ok",
+            "good",
+            "none",
+            "немає",
+            "все ок",
+        ]:
+            raise ValueError(
+                "При статусі REJECTED фідбек має детальніше пояснювати причину відхилення."
+            )
+
+        return self
+
+
 @tool("sympy_solver_tool", args_schema=SolveAlgebraicInput)
 def sympy_solver_tool(expression_str: str, variable: str = "x") -> str:
     """
@@ -253,6 +311,23 @@ def geometry_2d_tool(
             return f"Формула: {formula} | Точно: {exact} | Приблизно (pi≈3.14): {float(exact):.2f}"
 
     return "Результат: ???"
+
+
+@tool
+def verify_math_expression(expression: str, expected_value: str) -> str:
+    """Перевіряє математичний вираз або рівняння за допомогою SymPy."""
+    try:
+        expr_sym = cast(sp.Expr, sp.sympify(expression))
+        expected_sym = cast(sp.Expr, sp.sympify(expected_value))
+
+        diff = sp.simplify(expr_sym - expected_sym)
+
+        if diff == 0:
+            return f"SUCCESS: Вираз '{expression}' повністю збігається з еталоном '{expected_value}'."
+        else:
+            return f"MISMATCH: Вираз '{expression}' дає {expr_sym}, що НЕ дорівнює очікуваному '{expected_value}'. Різниця: {diff}"
+    except Exception as e:
+        return f"ERROR: Помилка парсингу SymPy: {str(e)}"
 
 
 # =====================================================================
@@ -404,19 +479,34 @@ def test_invalid_grade_too_high():
     assert "Клас має бути в межах від 1 до 11" in str(exc_info.value)
 
 
-def test_missing_equality_in_equation():
-    """Перевірка помилки, якщо рівняння не містить знака дорівнює/порівняння."""
-    with pytest.raises(ValidationError) as exc_info:
-        GeneratedMathProblem(
-            topic="Алгебра",
-            grade=8,
-            title="Тестова задача",
-            problem_statement="Текст умови задачі більшої довжини...",
-            canonical_equation="x**2 + 3*x - 28",  # Немає '='
-            step_by_step_solution="Покроковий розв'язок...",
-            canonical_answer="5",
-        )
-    assert "має містити знак рівності" in str(exc_info.value)
+def test_autofix_missing_equality_in_equation():
+    """Перевірка, що вираз без '=' автоматично перетворюється на рівняння з 'x ='."""
+    problem = GeneratedMathProblem(
+        topic="Алгебра",
+        grade=8,
+        title="Тестова задача",
+        problem_statement="Текст умови задачі більшої довжини...",
+        canonical_equation="x**2 + 3*x - 28",  # Немає '='
+        step_by_step_solution="Покроковий розв'язок...",
+        canonical_answer="5",
+    )
+    # Перевіряємо, що автофікс підставив "x = "
+    assert problem.canonical_equation == "x = x**2 + 3*x - 28"
+
+
+# def test_missing_equality_in_equation():
+#     """Перевірка помилки, якщо рівняння не містить знака дорівнює/порівняння."""
+#     with pytest.raises(ValidationError) as exc_info:
+#         GeneratedMathProblem(
+#             topic="Алгебра",
+#             grade=8,
+#             title="Тестова задача",
+#             problem_statement="Текст умови задачі більшої довжини...",
+#             canonical_equation="x**2 + 3*x - 28",  # Немає '='
+#             step_by_step_solution="Покроковий розв'язок...",
+#             canonical_answer="5",
+#         )
+#     assert "має містити знак рівності" in str(exc_info.value)
 
 
 def test_too_short_problem_statement():
@@ -432,3 +522,146 @@ def test_too_short_problem_statement():
             canonical_answer="5",
         )
     assert "занадто короткий" in str(exc_info.value)
+
+
+# =====================================================================
+# Тести EvaluationResult
+# =====================================================================
+
+# ---------------------------------------------------------------------
+# 1. Позитивні тести (Happy Path)
+# ---------------------------------------------------------------------
+
+
+def test_valid_evaluation_result_passed():
+    """Тест успішного створення вердикту PASSED."""
+    eval_res = EvaluationResult(
+        is_correct_math=True,
+        is_clear_text=True,
+        status="PASSED",
+        feedback="  Задача складена чудово, помилок немає.  ",
+    )
+    assert eval_res.is_correct_math is True
+    assert eval_res.is_clear_text is True
+    assert eval_res.status == "PASSED"
+    # Перевірка стрипінгу
+    assert eval_res.feedback == "Задача складена чудово, помилок немає."
+
+
+def test_valid_evaluation_result_rejected():
+    """Тест успішного створення вердикту REJECTED з деталізованим фідбеком."""
+    eval_res = EvaluationResult(
+        is_correct_math=False,
+        is_clear_text=True,
+        status="REJECTED",
+        feedback="Помилка в обчисленнях на кроці 2: 12 / 3 не дорівнює 5.",
+    )
+    assert eval_res.status == "REJECTED"
+    assert eval_res.is_correct_math is False
+
+
+# ---------------------------------------------------------------------
+# 2. Негативні тести (Конфлікти логіки та некоректний ввід)
+# ---------------------------------------------------------------------
+
+
+def test_inconsistent_passed_status_when_math_failed():
+    """Перевірка виклику помилки, якщо математика хибна, але статус стоїть PASSED."""
+    with pytest.raises(ValidationError) as exc_info:
+        EvaluationResult(
+            is_correct_math=False,
+            is_clear_text=True,
+            status="PASSED",
+            feedback="Помилка в обчисленнях, але статус чомусь PASSED",
+        )
+    assert "статус 'status' має бути обов'язково 'REJECTED'" in str(exc_info.value)
+
+
+def test_inconsistent_passed_status_when_text_failed():
+    """Перевірка виклику помилки, якщо текст некоректний, але статус стоїть PASSED."""
+    with pytest.raises(ValidationError) as exc_info:
+        EvaluationResult(
+            is_correct_math=True,
+            is_clear_text=False,
+            status="PASSED",
+            feedback="Текст містить росіянізми.",
+        )
+    assert "статус 'status' має бути обов'язково 'REJECTED'" in str(exc_info.value)
+
+
+def test_inconsistent_rejected_status_when_everything_ok():
+    """Перевірка виклику помилки, якщо і математика, і текст OK, але статус стоїть REJECTED."""
+    with pytest.raises(ValidationError) as exc_info:
+        EvaluationResult(
+            is_correct_math=True,
+            is_clear_text=True,
+            status="REJECTED",
+            feedback="Все правильно, але статус REJECTED",
+        )
+    assert "статус 'status' має бути обов'язково 'PASSED'" in str(exc_info.value)
+
+
+def test_too_short_feedback():
+    """Перевірка захисту від занадто короткого фідбеку."""
+    with pytest.raises(ValidationError) as exc_info:
+        EvaluationResult(
+            is_correct_math=True,
+            is_clear_text=True,
+            status="PASSED",
+            feedback="Ок",  # Менше 5 символів
+        )
+    assert "занадто короткий" in str(exc_info.value)
+
+
+def test_rejected_with_meaningless_feedback():
+    """Перевірка заборони безназмістовного фідбеку при відхиленні задачі."""
+    with pytest.raises(ValidationError) as exc_info:
+        EvaluationResult(
+            is_correct_math=False,
+            is_clear_text=True,
+            status="REJECTED",
+            feedback="все ок",
+        )
+    assert "фідбек має детальніше пояснювати причину" in str(exc_info.value)
+
+
+def test_extra_fields_forbidden_in_evaluation_result():
+    """Перевірка заборони додаткових полів через ConfigDict(extra='forbid')."""
+    with pytest.raises(ValidationError) as exc_info:
+        EvaluationResult(
+            is_correct_math=True,
+            is_clear_text=True,
+            status="PASSED",
+            feedback="Все чудово",
+            score=10,  # Заборонене додаткове поле
+        )
+    assert "Extra inputs are not permitted" in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------
+# 3. Параметризований тест для комбінацій прапорців
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "math_ok, text_ok, expected_status",
+    [
+        (True, True, "PASSED"),
+        (False, True, "REJECTED"),
+        (True, False, "REJECTED"),
+        (False, False, "REJECTED"),
+    ],
+)
+def test_evaluation_status_matrix(math_ok: bool, text_ok: bool, expected_status: str):
+    """Параметризована перевірка матриці відповідності булевих прапорців і статусу."""
+    feedback_text = (
+        "Все добре" if expected_status == "PASSED" else "Виявлено помилки у задачі"
+    )
+
+    eval_res = EvaluationResult(
+        is_correct_math=math_ok,
+        is_clear_text=text_ok,
+        status=expected_status,
+        feedback=feedback_text,
+    )
+    assert eval_res.status == expected_status
