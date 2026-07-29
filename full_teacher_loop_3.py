@@ -1,7 +1,9 @@
 import json
 import time
 
-from agent import OverallState, app
+from langgraph.graph.state import RunnableConfig
+
+from agent import OverallState, app, logger_callback
 
 if __name__ == "__main__":
     initial_input: OverallState = {
@@ -22,7 +24,7 @@ if __name__ == "__main__":
     start_time = time.time()
     try:
         # Для LangGraph можна використовувати recursion_limit як додаткову підтримку
-        config = {"recursion_limit": 25}
+        config: RunnableConfig = {"recursion_limit": 25, "callbacks": [logger_callback]}
 
         # Обгортка виклику з перевіркою тайм-ауту
         final_output = app.invoke(initial_input, config=config)

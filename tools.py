@@ -665,3 +665,62 @@ def test_evaluation_status_matrix(math_ok: bool, text_ok: bool, expected_status:
         feedback=feedback_text,
     )
     assert eval_res.status == expected_status
+
+
+# =====================================================================
+# Тести для LangChain Tools
+# =====================================================================
+
+# ---------------------------------------------------------------------
+# 1. Тести sympy_solver_tool
+# ---------------------------------------------------------------------
+
+
+def test_sympy_solver_tool_success():
+    """Перевірка знаходження дійсних коренів квадратного рівняння x^2 - 5x + 6 = 0."""
+    raw_res = sympy_solver_tool.invoke(
+        {"expression_str": "x**2 - 5*x + 6", "variable": "x"}
+    )
+    res = json.loads(raw_res)
+
+    assert res["status"] == "success"
+    assert "2" in res["solutions"]
+    assert "3" in res["solutions"]
+
+
+def test_sympy_solver_tool_error_handling():
+    """Перевірка обробки некоректного виразу (Schema/SymPy validation error)."""
+    # Оскільки схема SolveAlgebraicInput валідує синтаксис SymPy ще до входу в тул,
+    # некоректний вираз викликає ValidationError.
+    with pytest.raises(ValidationError):
+        sympy_solver_tool.invoke({"expression_str": "x**2 - + *", "variable": "x"})
+
+
+# ---------------------------------------------------------------------
+# 4. Тести verify_math_expression
+# ---------------------------------------------------------------------
+
+
+def test_verify_math_expression_success():
+    """Перевірка точного збігу еквівалентних математичних виразів."""
+    res = verify_math_expression.invoke(
+        {"expression": "2*(x + 3)", "expected_value": "2*x + 6"}
+    )
+    assert res.startswith("SUCCESS:")
+
+
+def test_verify_math_expression_mismatch():
+    """Перевірка ситуації, коли вирази не збігаються."""
+    res = verify_math_expression.invoke(
+        {"expression": "x + 5", "expected_value": "x + 10"}
+    )
+    assert res.startswith("MISMATCH:")
+    assert "Різниця: -5" in res
+
+
+def test_verify_math_expression_invalid_syntax():
+    """Перевірка перехоплення синтаксичних помилок SymPy."""
+    res = verify_math_expression.invoke(
+        {"expression": "x + / 5", "expected_value": "10"}
+    )
+    assert res.startswith("ERROR:")

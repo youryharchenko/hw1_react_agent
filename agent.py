@@ -1,5 +1,5 @@
 import json
-from typing import Annotated, Literal, TypedDict, cast
+from typing import Annotated, Literal, Sequence, TypedDict, cast
 
 from langchain_core.messages import (
     AIMessage,
@@ -13,6 +13,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, ValidationError
 
+from logger import TrajectoryLogger
 from tools import (
     EvaluationResult,
     GeneratedMathProblem,
@@ -34,6 +35,37 @@ class OverallState(TypedDict):
     # Додаткові поля для детекції зациклення tool calls
     tool_call_history: list[str]
     eval_steps: int
+
+
+def extract_tool_calls(message: AIMessage) -> Sequence[dict]:
+    # 1. Якщо є рідні (native) tool_calls від LangChain
+    if hasattr(message, "tool_calls") and message.tool_calls:
+        return message.tool_calls
+
+    # 2. Якщо модель вивела JSON-рядки у content
+    extracted_calls = []
+    if message.content:
+        # Шукаємо JSON-подібні фрагменти {"name": ..., "arguments": ...}
+        # або кілька JSON на різних рядках
+        lines = message.content.strip().split("\n")
+        for idx, line in enumerate(lines):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+                if isinstance(data, dict) and "name" in data:
+                    extracted_calls.append(
+                        {
+                            "name": data["name"],
+                            "args": data.get("arguments", data.get("args", {})),
+                            "id": f"call_parsed_{idx}",  # Генеруємо тимчасовий ID
+                        }
+                    )
+            except json.JSONDecodeError:
+                continue
+
+    return extracted_calls
 
 
 # ==========================================
@@ -68,8 +100,10 @@ available_tools = [
     sympy_solver_tool,
 ]
 
-llm_with_tools = llm.bind_tools(available_tools)
+llm_with_tools = llm.bind_tools(available_tools, tool_choice="auto")
 tools_by_name = {t.name: t for t in available_tools}
+
+logger_callback = TrajectoryLogger()
 
 
 # ==========================================
@@ -86,8 +120,11 @@ def tool_execution_node(state: OverallState) -> dict:
     tool_messages = []
     history = list(state.get("tool_call_history", []))
 
+    # print(f"tool_execution_node - last_message: {last_message}")
+
     if isinstance(last_message, AIMessage) and last_message.tool_calls:
-        for tool_call in last_message.tool_calls:
+        tool_calls = extract_tool_calls(last_message)
+        for tool_call in tool_calls:
             tool_name = tool_call["name"]
             tool_args = tool_call["args"]
 
@@ -106,7 +143,10 @@ def tool_execution_node(state: OverallState) -> dict:
                     result = f"Error: Tool {tool_name} not found."
 
             tool_messages.append(
-                ToolMessage(content=str(result), tool_call_id=tool_call["id"])
+                ToolMessage(
+                    content=str(result),
+                    tool_call_id=tool_call.get("id", "call_fallback"),
+                )
             )
 
     return {"messages": tool_messages, "tool_call_history": history}
@@ -145,27 +185,54 @@ def generate_structured_output_node(state: OverallState) -> dict:
 
 def router_edge(state: OverallState) -> Literal["tools", "generate_structured_output"]:
     last_message = state["messages"][-1]
+    # print(f"router_edge - last_message: {last_message}")
 
-    # --- ЗАХИСТ 2: max_steps для підграфу Evaluator ---
     if state.get("eval_steps", 0) >= MAX_EVAL_STEPS:
         print(
             f"⚠️ [Evaluator] Досягнуто max_steps ({MAX_EVAL_STEPS}). Примусовий вихід на генерацію вердикту."
         )
         return "generate_structured_output"
 
-    if isinstance(last_message, AIMessage) and last_message.tool_calls:
-        # Перевірка чи не було зациклення на останньому кроці
-        last_history = state.get("tool_call_history", [])
-        for tool_call in last_message.tool_calls:
-            sig = f"{tool_call['name']}:{json.dumps(tool_call['args'], sort_keys=True)}"
-            if sig in last_history:
-                print(
-                    "⚠️ [Evaluator] Виявлено повторюваний tool call. Зупинка виклику інструментів."
-                )
-                return "generate_structured_output"
-        return "tools"
+    if isinstance(last_message, AIMessage):
+        tool_calls = extract_tool_calls(last_message)
+        if tool_calls:
+            last_message.tool_calls = tool_calls
+            last_history = state.get("tool_call_history", [])
+            for tool_call in tool_calls:
+                sig = f"{tool_call['name']}:{json.dumps(tool_call['args'], sort_keys=True)}"
+                if sig in last_history:
+                    print(
+                        "⚠️ [Evaluator] Виявлено повторюваний tool call. Зупинка виклику інструментів."
+                    )
+                    return "generate_structured_output"
+            return "tools"
 
     return "generate_structured_output"
+
+
+# def router_edge(state: OverallState) -> Literal["tools", "generate_structured_output"]:
+#     last_message = state["messages"][-1]
+#     print(f"router_edge - last_message: {last_message}")
+#     # --- ЗАХИСТ 2: max_steps для підграфу Evaluator ---
+#     if state.get("eval_steps", 0) >= MAX_EVAL_STEPS:
+#         print(
+#             f"⚠️ [Evaluator] Досягнуто max_steps ({MAX_EVAL_STEPS}). Примусовий вихід на генерацію вердикту."
+#         )
+#         return "generate_structured_output"
+
+#     if isinstance(last_message, AIMessage) and last_message.tool_calls:
+#         # Перевірка чи не було зациклення на останньому кроці
+#         last_history = state.get("tool_call_history", [])
+#         for tool_call in last_message.tool_calls:
+#             sig = f"{tool_call['name']}:{json.dumps(tool_call['args'], sort_keys=True)}"
+#             if sig in last_history:
+#                 print(
+#                     "⚠️ [Evaluator] Виявлено повторюваний tool call. Зупинка виклику інструментів."
+#                 )
+#                 return "generate_structured_output"
+#         return "tools"
+
+#     return "generate_structured_output"
 
 
 # ==========================================
@@ -250,7 +317,9 @@ def evaluator_node(state: OverallState) -> dict:
                     "Правила оцінювання:\n"
                     "1. Якщо математика та відповідь РЕАЛЬНО правильні — став status='PASSED'.\n"
                     "2. Не відхиляй задачу через незначні стилістичні огріхи або формулювання тексту, якщо суть зрозуміла учню.\n"
-                    "3. Став 'REJECTED' ТІЛЬКИ якщо є явна математична помилка, суперечливі дані або повна відсутність розв'язку."
+                    "3. Став 'REJECTED' ТІЛЬКИ якщо є явна математична помилка, суперечливі дані або повна відсутність розв'язку.\n"
+                    "4. Ти НЕ маєш права ставити вердикт PASSED/FAILED на основі власних розрахунків."
+                    "   Ти ЗОБОВ'ЯЗАНИЙ викликати інструмент verify_math_expression для кожної формули та обчислення в рішеннях.\n"
                 )
             ),
             HumanMessage(content=f"Перевір задачу:\n{task_text}"),
@@ -259,7 +328,9 @@ def evaluator_node(state: OverallState) -> dict:
         "eval_steps": 0,
     }
 
-    res = evaluator_graph.invoke(cast(OverallState, eval_input))
+    res = evaluator_graph.invoke(
+        cast(OverallState, eval_input), config={"callbacks": [logger_callback]}
+    )
     last_msg = res["messages"][-1]
 
     try:
