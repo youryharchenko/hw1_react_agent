@@ -314,7 +314,7 @@ def geometry_2d_tool(
 
 
 @tool
-def verify_math_expression(expression: str, expected_value: str) -> str:
+def verify_math_expression(expression: str, expected_value: str = "") -> str:
     """Перевіряє математичний вираз або рівняння за допомогою SymPy."""
     try:
         expr_sym = cast(sp.Expr, sp.sympify(expression))

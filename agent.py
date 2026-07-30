@@ -210,31 +210,6 @@ def router_edge(state: OverallState) -> Literal["tools", "generate_structured_ou
     return "generate_structured_output"
 
 
-# def router_edge(state: OverallState) -> Literal["tools", "generate_structured_output"]:
-#     last_message = state["messages"][-1]
-#     print(f"router_edge - last_message: {last_message}")
-#     # --- ЗАХИСТ 2: max_steps для підграфу Evaluator ---
-#     if state.get("eval_steps", 0) >= MAX_EVAL_STEPS:
-#         print(
-#             f"⚠️ [Evaluator] Досягнуто max_steps ({MAX_EVAL_STEPS}). Примусовий вихід на генерацію вердикту."
-#         )
-#         return "generate_structured_output"
-
-#     if isinstance(last_message, AIMessage) and last_message.tool_calls:
-#         # Перевірка чи не було зациклення на останньому кроці
-#         last_history = state.get("tool_call_history", [])
-#         for tool_call in last_message.tool_calls:
-#             sig = f"{tool_call['name']}:{json.dumps(tool_call['args'], sort_keys=True)}"
-#             if sig in last_history:
-#                 print(
-#                     "⚠️ [Evaluator] Виявлено повторюваний tool call. Зупинка виклику інструментів."
-#                 )
-#                 return "generate_structured_output"
-#         return "tools"
-
-#     return "generate_structured_output"
-
-
 # ==========================================
 # 4. ВУЗЛИ ТА ГРАФ MAIN LOOP
 # ==========================================
