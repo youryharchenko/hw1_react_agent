@@ -1,4 +1,5 @@
 import json
+import re
 from typing import Literal, Optional, cast
 
 import pytest
@@ -133,6 +134,15 @@ class GeneratedMathProblem(BaseModel):
             return f"x = {v}"
         return v
 
+    @field_validator("grade", mode="before")
+    def parse_grade(cls, v):
+        if isinstance(v, str):
+            # Витягуємо першу цифру з рядка "5 клас" -> 5
+            match = re.search(r"\d+", v)
+            if match:
+                return int(match.group())
+        return v
+
 
 class EvaluationResult(BaseModel):
     """Результат перевірки та оцінки математичної задачі."""
@@ -187,6 +197,49 @@ class EvaluationResult(BaseModel):
         ]:
             raise ValueError(
                 "При статусі REJECTED фідбек має детальніше пояснювати причину відхилення."
+            )
+
+        return self
+
+
+class VerifyMathInput(BaseModel):
+    """Схема валідації вхідних даних для верифікації математичних розрахунків.
+    ОБОВ'ЯЗКОВИЙ ІНСТРУМЕНТ для точного тотожного та символьного розв'язання виразів через SymPy.
+        Викликай цей інструмент ЗАВЖДИ, коли потрібно перевірити результат.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    expression: str = Field(
+        ...,
+        description="Вираз у форматі Python/SymPy, наприклад 'x**2 - 5*x + 6'. ПІДНЕСЕННЯ ДО СТЕПЕНЯ ТІЛЬКИ ЧЕРЕЗ '**'!",
+    )
+    expected_value: str = Field(
+        description="Вираз у форматі Python/SymPy. Очікуване значення виразу."
+    )
+
+    @model_validator(mode="after")
+    def validate_and_clean_expression(self) -> "VerifyMathInput":
+        # 1. Автоматично виправляємо символ піднесення до степеня '^' на '**'
+        if "^" in self.expression:
+            self.expression = self.expression.replace("^", "**")
+
+        # 2. Перевіряємо, чи є вираз синтаксично коректним для SymPy
+        try:
+            sp.sympify(self.expression)
+        except Exception as e:
+            raise ValueError(
+                f"Некоректний математичний вираз '{self.expression}'. "
+                f"Помилка парсингу SymPy: {str(e)}"
+            )
+
+        # 3. Валідація очікуваного значення
+        try:
+            sp.sympify(self.expected_value)
+        except Exception as e:
+            raise ValueError(
+                f"Некоректний математичний вираз '{self.expected_value}'. "
+                f"Помилка парсингу SymPy: {str(e)}"
             )
 
         return self
@@ -313,10 +366,22 @@ def geometry_2d_tool(
     return "Результат: ???"
 
 
-@tool
-def verify_math_expression(expression: str, expected_value: str = "") -> str:
+@tool("verify_math_expression", args_schema=VerifyMathInput)
+def verify_math_expression(expression: str, expected_value: str) -> str:
     """Перевіряє математичний вираз або рівняння за допомогою SymPy."""
     try:
+        # Автоматичне виправлення: якщо передано 'x = 144 / 24', залишаємо тільки праву частину
+        # або порівнюємо ліву і праву частини.
+        if "=" in expression and not any(op in expression for op in ["==", "<=", ">="]):
+            parts = expression.split("=")
+            # Якщо зліва просто змінна (наприклад, 'x'), порівнюємо праву частину з expected_value
+            left, right = parts[0].strip(), parts[1].strip()
+            if left.isidentifier() and not expected_value:
+                expression = right
+            elif expected_value == "":
+                expression = f"({left}) - ({right})"
+                expected_value = "0"
+
         expr_sym = cast(sp.Expr, sp.sympify(expression))
         expected_sym = cast(sp.Expr, sp.sympify(expected_value))
 

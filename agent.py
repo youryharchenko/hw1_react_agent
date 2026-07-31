@@ -77,7 +77,10 @@ MAX_EVAL_STEPS = 5  # Захист max_steps для внутрішнього ц�
 # ==========================================
 # 2. НАЛАШТУВАННЯ МОДЕЛЕЙ
 # ==========================================
-MODEL_NAME = "qwen2.5-coder:7b"
+# MODEL_NAME = "qwen2.5-coder:7b"
+# MODEL_NAME = "qwen3.5:9b"
+MODEL_NAME = "gemma4:e4b"
+# MODEL_NAME = "qwen2.5-coder:14b"
 OLLAMA_SERVER_IP = "192.168.2.102"
 
 TIMEOUT_SEC = 60  # Загальний тайм-аут у секундах
@@ -85,13 +88,16 @@ TIMEOUT_SEC = 60  # Загальний тайм-аут у секундах
 llm = ChatOllama(
     model=MODEL_NAME,
     temperature=0.1,
-    num_predict=1024,
+    num_predict=8192,
+    reasoning=False,
     base_url=f"http://{OLLAMA_SERVER_IP}:11434",
     client_kwargs={"timeout": TIMEOUT_SEC},
 )
 
-llm_gen_structured = llm.with_structured_output(GeneratedMathProblem)
-llm_eval_structured = llm.with_structured_output(EvaluationResult)
+llm_gen_structured = llm.with_structured_output(
+    GeneratedMathProblem, method="json_mode"
+)
+llm_eval_structured = llm.with_structured_output(EvaluationResult, method="json_mode")
 
 available_tools = [
     verify_math_expression,
@@ -100,7 +106,7 @@ available_tools = [
     sympy_solver_tool,
 ]
 
-llm_with_tools = llm.bind_tools(available_tools, tool_choice="auto")
+llm_with_tools = llm.bind_tools(available_tools, tool_choice="any")
 tools_by_name = {t.name: t for t in available_tools}
 
 logger_callback = TrajectoryLogger()
@@ -157,23 +163,22 @@ def generate_structured_output_node(state: OverallState) -> dict:
         SystemMessage(
             content=(
                 "Ти — методист-експерт. Проаналізуй задачу та результати її математичної перевірки з історії. "
-                "Сформуй підсумковий структурований вердикт у форматі JSON."
+                "Сформуй підсумковий структурований вердикт у форматі JSON.\n\n"
+                "ВАЖЛИВО: Твоя відповідь МУСИТЬ бути СТРОГО єдиним об'єктом JSON без жодного додаткового тексту, "
+                "пояснень, вступів чи markdown-тегів (без ```json ... ```).\n\n"
             )
         )
     ] + state["messages"]
 
     try:
-        structured_verdict = llm_eval_structured.invoke(prompt)
-
-        if isinstance(structured_verdict, dict):
-            content_str = json.dumps(structured_verdict, ensure_ascii=False)
-        elif isinstance(structured_verdict, BaseModel):
-            content_str = structured_verdict.model_dump_json()
-        else:
-            content_str = str(structured_verdict)
+        # Використовуємо зв'язану модель для structured output
+        verdict_obj: EvaluationResult = llm_eval_structured.invoke(prompt)
+        content_str = verdict_obj.model_dump_json()
     except Exception as err:
         content_str = json.dumps(
             {
+                "is_correct_math": False,
+                "is_clear_text": False,
                 "status": "REJECTED",
                 "feedback": f"Помилка генерації структурованого вердикту: {str(err)}",
             },
@@ -225,8 +230,20 @@ def generator_node(state: OverallState) -> dict:
     if iterations == 1:
         system_prompt = (
             "Ти — досвідчений вчитель математики.\n"
-            "ОБОВ'ЯЗКОВО заповнюй поле 'canonical_equation' (канонічне рівняння чи вираз зі знаком '='). "
-            "Наприклад, 'x = 24 * (1/3)' або 'x = 8'."
+            "1. Заповнюй поле 'canonical_equation' як чистий вираз Python/SymPy зі знаком '=' (наприклад, 'x = 144 / 24' або 'x = 150 * 10 + 30 * 6 + 400 * 2').\n"
+            "2. У полях 'canonical_equation' та обчисленнях НЕ використовуй текстові одиниці виміру (наприклад, пишемо '150 * 10', а не '150 грн * 10 м2').\n"
+            "3. Використовуй '**' для піднесення до степеня.\n\n"
+            "ВАЖЛИВО: Твоя відповідь МУСИТЬ бути СТРОГО єдиним об'єктом JSON без жодного додаткового тексту, "
+            "пояснень, вступів чи markdown-тегів (без ```json ... ```).\n\n"
+            "Згенеруй JSON-об'єкт. Всі поля мають бути на ВЕРХНЬОМУ рівні JSON (без зовнішнього ключа 'task').\n"
+            "Обов'язкові поля:\n"
+            "- topic\n"
+            "- grade\n"
+            "- title\n"
+            "- problem_statement\n"
+            "- canonical_equation\n"
+            "- step_by_step_solution\n"
+            "- canonical_answer\n"
         )
         current_messages = [
             SystemMessage(content=system_prompt),
@@ -239,6 +256,7 @@ def generator_node(state: OverallState) -> dict:
         current_messages = state["messages"] + [
             HumanMessage(
                 content=(
+                    "ВАЖЛИВО: Одразу згенеруй відповідь у форматі JSON без довгих роздумів, тегів <think> та вступного тексту.\n"
                     f"Попередня версія відхилена оцінювачем з зауваженням:\n"
                     f'"{feedback_str}"\n\n'
                     f"Виправи це зауваження. УВАГА: Не дублюй текст умови в розв'язку! "
@@ -249,6 +267,9 @@ def generator_node(state: OverallState) -> dict:
 
     try:
         response = llm_gen_structured.invoke(current_messages)
+        # response = llm.invoke(current_messages)
+        print(f"generator_node - response: {response}")
+
         task_dict = response if isinstance(response, dict) else response.model_dump()
         return {
             "task": task_dict,
@@ -289,12 +310,20 @@ def evaluator_node(state: OverallState) -> dict:
             SystemMessage(
                 content=(
                     "Ти — лояльний методист з математики. Твоя головна мета — перевірити МАТЕМАТИЧНУ КОРЕКТНІСТЬ.\n"
+                    "Ти ЗОБОВ'ЯЗАНИЙ викликати інструмент verify_math_expression для обчислення кожного виразу в рішеннях.\n"
+                    "   Для інструменту verify_math_expression обов'язково задавай параметр expected_value.\n"
                     "Правила оцінювання:\n"
                     "1. Якщо математика та відповідь РЕАЛЬНО правильні — став status='PASSED'.\n"
                     "2. Не відхиляй задачу через незначні стилістичні огріхи або формулювання тексту, якщо суть зрозуміла учню.\n"
-                    "3. Став 'REJECTED' ТІЛЬКИ якщо є явна математична помилка, суперечливі дані або повна відсутність розв'язку.\n"
-                    "4. Ти НЕ маєш права ставити вердикт PASSED/FAILED на основі власних розрахунків."
-                    "   Ти ЗОБОВ'ЯЗАНИЙ викликати інструмент verify_math_expression для кожної формули та обчислення в рішеннях.\n"
+                    "3. Став 'REJECTED' ТІЛЬКИ якщо є явна математична помилка, суперечливі дані або повна відсутність розв'язку."
+                    "   Якщо хоча б один із прапорців (is_correct_math або is_clear_text) дорівнює false, status МУСИТЬ бути 'REJECTED'.\n\n"
+                    "ВАЖЛИВО: Твоя відповідь МУСИТЬ бути СТРОГО єдиним об'єктом JSON без жодного додаткового тексту, "
+                    "пояснень, вступів чи markdown-тегів (без ```json ... ```).\n\n"
+                    "Обов'язково повернути JSON з ЧОТИРМА полями:\n"
+                    "- is_correct_math (boolean)\n"
+                    "- is_clear_text (boolean)\n"
+                    "- feedback (string, ТІЛЬКИ ЦЯ НАЗВА, не використовуй reasoning!)\n"
+                    "- status ('PASSED' або 'REJECTED')\n"
                 )
             ),
             HumanMessage(content=f"Перевір задачу:\n{task_text}"),
